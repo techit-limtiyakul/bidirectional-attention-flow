@@ -58,8 +58,6 @@ class WordEmbedding(nn.Module):
         return self.embedding(x)
 
 
-# In[4]:
-
 
 class Highway(nn.Module):
     def __init__(self, in_size, n_layers=2, act=F.relu):
