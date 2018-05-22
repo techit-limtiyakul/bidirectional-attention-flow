@@ -1,6 +1,6 @@
 # PyTorch implementation for Bi-directional Attention Flow model 
-
-### In Order to run
+https://arxiv.org/abs/1611.01603
+In Order to run,
 ## 1. Download  SQuAD dataset and GloVe embeddings
 (~850 MB, this will download files to `$HOME/data`):
 ```
