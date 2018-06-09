@@ -146,7 +146,7 @@ class DataSet(object):
         idxs = list(range(self.size()))
         if shuffle:
             np.random.shuffle(idxs)
-        for i in range(self.size()):
+        for i in idxs:
             rx = self.data['*x'][i] 
             c  = lower_list(self.shared['x'][rx[0]][rx[1]][0])
             # if len(c) > 150: continue

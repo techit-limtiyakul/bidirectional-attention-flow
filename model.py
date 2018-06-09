@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataset import to_var
 
 
 class CharEmbedding(nn.Module):
@@ -58,7 +59,6 @@ class WordEmbedding(nn.Module):
         return self.embedding(x)
 
 
-
 class Highway(nn.Module):
     def __init__(self, in_size, n_layers=2, act=F.relu):
         super(Highway, self).__init__()
@@ -76,6 +76,16 @@ class Highway(nn.Module):
             x = gate * normal_layer_ret + (1 - gate) * x
         return x
 
+class GRU_With_Dropout(nn.Module):
+    def __init__(self, in_size, hidden_size, num_layers=1, dropout=0.2, bidirectional=True, batch_first=True):
+        super(GRU_With_Dropout, self).__init__()
+        #Pytorch GRU implementation apply dropout to only output
+        self.dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(in_size, hidden_size, num_layers=num_layers, dropout=dropout, bidirectional=bidirectional, batch_first=batch_first)
+        
+    def forward(self, x, hidden=None):
+        gru_out, _h = self.gru(x)
+        return self.dropout(gru_out), _h
 
 class ContextualEmbedding(nn.Module):
     def __init__(self, args):
@@ -84,8 +94,7 @@ class ContextualEmbedding(nn.Module):
         self.char_embd_net = CharEmbedding(args)
         self.word_embd_net = WordEmbedding(args)
         self.highway_net = Highway(self.d)
-        self.ctx_embd_layer = nn.GRU(self.d, self.d, bidirectional=True, dropout=0.2, batch_first=True)
-
+        self.ctx_embd_layer = GRU_With_Dropout(self.d, self.d, bidirectional=True, dropout=0.2, batch_first=True)
     
     def forward(self, char, word):
         # 1. Character Embedding Layer
@@ -112,7 +121,7 @@ class AttentionalFlow(nn.Module):
         T = embd_context.size(1)   # context sentence length (word level)
         J = embd_query.size(1)     # query sentence length   (word level)
         
-        # 4. Attention Flow Layer
+         # 4. Attention Flow Layer
         # Make a similarity matrix
         shape = (batch_size, T, J, 2*self.d)            # (N, T, J, 2d)
         embd_context_ex = embd_context.unsqueeze(2)     # (N, T, 1, 2d)
@@ -135,6 +144,36 @@ class AttentionalFlow(nn.Module):
         G = torch.cat((embd_context, c2q, embd_context.mul(c2q), embd_context.mul(q2c)), 2) # (N, T, 8d)
         return G
 
+class AnswerLayer(nn.Module):
+    def __init__(self, args):
+        super(AnswerLayer, self).__init__()
+        self.d = args.w_embd_size*2
+        self.bilinear_w1 = nn.Linear(2*self.d, 2*self.d, bias=False)
+        self.bilinear_w2 = nn.Linear(2*self.d, 4*self.d, bias=False)
+        self.bilinear_beta = nn.Linear(2*self.d, 2*self.d, bias=False)
+        self.next_state_lstm = nn.GRU(2*self.d, 2*self.d, dropout=0, bidirectional=False, batch_first=True)
+    def forward(self, state, M):
+        # state: (N, 1, 2d)
+        # M: (N, T, 2d)
+        T = M.size(1)
+        
+        logits1 = torch.bmm(self.bilinear_w1(M), state.squeeze().unsqueeze(-1)).squeeze() #(N, T, 2d)*(2d, 2d)*(N, 2d, 1)
+
+        p1 = F.softmax(logits1, dim=-1) # (N, T)
+  
+        p1mem = torch.bmm(p1.unsqueeze(1), M) # (N, 1, 2d)
+        p1s = torch.cat((p1mem, state), -1) # (N, 1, 4d)
+        
+        logits2 = torch.bmm(self.bilinear_w2(M), p1s.squeeze().unsqueeze(-1)).squeeze() #(N, T, 2d)*(2d, 4d)*(N, 4d, 1)
+
+        p2 = F.softmax(logits2, dim=-1) # (N, T)
+    
+        logits_beta = torch.bmm(self.bilinear_beta(M), state.squeeze().unsqueeze(-1)) #(N, T, 2d)*(2d, 2d)*(N, 2d, 1)
+        beta = F.softmax(logits_beta, dim=-1).view((-1, 1, T)) # (N, 1, T)
+        x_t = torch.bmm(beta, M) # (N, 1, 2d)
+
+        state_2, _h = self.next_state_lstm(state, x_t.squeeze().unsqueeze(0)) #(N, 1, 2d)
+        return state_2, p1, p2
 
 class BiDAF(nn.Module):
     def __init__(self, args):
@@ -144,20 +183,30 @@ class BiDAF(nn.Module):
         self.ctx_embd_layer = ContextualEmbedding(args)
         self.attentional_flow_layer = AttentionalFlow(args)
 
-        self.modeling_layer = nn.GRU(8*self.d, self.d, num_layers=2, bidirectional=True, dropout=0.2, batch_first=True)
+        self.modeling_layer = GRU_With_Dropout(8*self.d, self.d, num_layers=2, dropout=0.2, bidirectional=True, batch_first=True)
 
-        self.p1_layer = nn.Linear(10*self.d, 1, bias=False)
-        self.p2_lstm_layer = nn.GRU(2*self.d, self.d, bidirectional=True, dropout=0.2, batch_first=True)
-        self.p2_layer = nn.Linear(10*self.d, 1)
 
+        self.p1_layer = nn.Sequential(nn.Dropout(0.2), nn.Linear(10*self.d, 1, bias=False))
+        self.p2_lstm_layer = GRU_With_Dropout(14*self.d, self.d, dropout=0.2, bidirectional=True, batch_first=True)
+
+        self.p2_layer = nn.Sequential(nn.Dropout(0.2), nn.Linear(10*self.d, 1))
+        
+        self.self_attn = nn.Linear(2*self.d, 1, bias=False)
+
+        self.answer_layer = AnswerLayer(args)
     def forward(self, ctx_w, ctx_c, query_w, query_c):
 
 
         # 1. Character Embedding Layer
         # 2. Word Embedding Layer
         # 3. Contextual  Embedding Layer
-        embd_context = self.ctx_embd_layer(ctx_c, ctx_w)
+        embd_context = self.ctx_embd_layer(ctx_c, ctx_w) # (N, T, 2d)
         embd_query   = self.ctx_embd_layer(query_c, query_w) # (N, J, 2d)
+        
+
+        
+        
+        T = embd_context.size(1) 
 
         # 4. Attention Flow Layer
         G = self.attentional_flow_layer(embd_context, embd_query)
@@ -166,11 +215,29 @@ class BiDAF(nn.Module):
         M, _h = self.modeling_layer(G) # M: (N, T, 2d)
 
         # 6. Output Layer
-        G_M = torch.cat((G, M), 2) # (N, T, 10d)
-        p1 = F.softmax(self.p1_layer(G_M).squeeze(), dim=-1) # (N, T)
 
-        M2, _ = self.p2_lstm_layer(M) # (N, T, 2d)
-        G_M2 = torch.cat((G, M2), 2) # (N, T, 10d)
-        p2 = F.softmax(self.p2_layer(G_M2).squeeze(), dim=-1) # (N, T)
+        # x: Self attention for embd query
+        self_attention = F.softmax(self.self_attn(embd_query).squeeze(), dim=-1) # (N, J)
+        state = torch.bmm(self_attention.unsqueeze(1), embd_query) #(N, 1, J) * (N, J, 2d) = (N, 1, 2d)
 
-        return p1, p2
+        p1_sum = to_var(torch.zeros(M.size(0), M.size(1)))
+        p2_sum = to_var(torch.zeros(M.size(0), M.size(1)))
+        p1_count = 1
+        p2_count = 1
+        
+        _, p1, p2 = self.answer_layer(state, M) #p1, p2: (N, T)
+
+
+        p1_sum += p1
+        p2_sum += p2
+        
+#         for i in range(2):
+#             state, p1_1, p2_1 = self.answer_layer(state, M) #p1, p2: (N, T)
+#             if np.random.rand()>.4 or not self.training:
+#                 p1_sum += p1_1
+#                 p1_count += 1
+#             if np.random.rand()>.4 or not self.training:
+#                 p2_sum += p2_1
+#                 p2_count += 1 
+
+        return p1_sum/p1_count, p2_sum/p2_count

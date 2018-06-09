@@ -164,11 +164,50 @@ def train(model, data, optimizer, ema, n_epoch=30, start_epoch=0, batch_size=arg
         }, filename=filename)
 
 
-# test() {{{
+def get_fwd_max(tp1):
+    p1_fwd_max = torch.zeros(tp1.size())
+    p1_fwd_maxind = torch.zeros(tp1.size())
+    current_max = tp1[:,0]
+    current_maxind = torch.zeros(tp1.size(0)).long()
+    p1_fwd_max[:,0] = current_max
+    p1_fwd_maxind[:,0] = current_maxind
+
+    for i in range(1, tp1.size(1)):
+        current_max, max_ind = torch.max(torch.stack((current_max, tp1[:,i])), 0)
+        current_maxind = torch.max(max_ind.cpu()*i, current_maxind)
+        p1_fwd_max[:,i] = current_max
+        p1_fwd_maxind[:,i] = current_maxind
+    return p1_fwd_max, p1_fwd_maxind
+
+def get_bck_max(tp1):
+    dim = tp1.size(1) - 1
+    p1_bck_max = torch.zeros(tp1.size())
+    p1_bck_maxind = torch.zeros(tp1.size())
+    current_max = tp1[:,dim]
+    current_maxind = torch.ones(tp1.size(0)).long() * dim
+    p1_bck_max[:,dim] = current_max
+    p1_bck_maxind[:,dim] = current_maxind
+
+    for i in range(1, dim+1):
+        current_max, max_ind = torch.max(torch.stack((current_max, tp1[:,dim-i])), 0)
+        current_maxind = torch.min((dim - (max_ind.cpu())*(i)), current_maxind)
+        p1_bck_max[:,dim-i] = current_max
+        p1_bck_maxind[:,dim-i] = current_maxind
+    return p1_bck_max, p1_bck_maxind
+
+def get_max_ind(tp1, tp2):
+    p1_fwd_max, p1_fwd_maxind = get_fwd_max(tp1)
+    p2_bck_max, p2_bck_maxind = get_bck_max(tp2)
+    maxind = torch.max(p1_fwd_max*p2_bck_max,1)[1]
+
+    p1 = p1_fwd_maxind[range(p1_fwd_max.size(0)), maxind].long()
+    p2 = p2_bck_maxind[range(p1_fwd_max.size(0)), maxind].long()
+    return p1, p2
+
 def test(model, data, batch_size=args.batch_size):
     print('----Test---')
     model.eval()
-    p1_acc, p2_acc = 0, 0
+    p1_acc, p2_acc, exact_match = 0, 0, 0
     total = 0
     batches = data.get_batches(batch_size)
     for i, batch in enumerate(tqdm(batches)):
@@ -181,14 +220,24 @@ def test(model, data, batch_size=args.batch_size):
         a_beg = ans_var[:, 0]
         a_end = ans_var[:, 1] - 1
         p1, p2 = model(c, cc, q, cq)
-        p1_acc += torch.sum(a_beg == torch.max(p1, 1)[1]).data[0]
-        p2_acc += torch.sum(a_end == torch.max(p2, 1)[1]).data[0]
+
+#         p1_pred = torch.max(p1, 1)[1]
+#         p2_pred = torch.max(p2, 1)[1]
+        p1_pred, p2_pred = get_max_ind(p1, p2)
+    
+        p1_corr = a_beg.cpu() == p1_pred
+        p2_corr = a_end.cpu() == p2_pred
+        
+        p1_acc += torch.sum(p1_corr).data[0]
+        p2_acc += torch.sum(p2_corr).data[0]
+        
+        exact_match += torch.sum(p1_corr * p2_corr).data[0]
         total += batch_size
         if i % 10 == 0:
-            print('current acc: {:.3f}%'.format(100*p1_acc/total))
+            print('current acc: {:.3f}%'.format(100*exact_match/total))
 
     print('======== Test result ========')
-    print('p1 acc: {:.3f}%, p2 acc: {:.3f}%'.format(100*p1_acc/total, 100*p2_acc/total))
+    print('p1 acc: {:.3f}%, p2 acc: {:.3f}%, EM: {:.3f}'.format(100.*p1_acc/total, 100.*p2_acc/total, 100.*exact_match/total))
 # }}}
 
 #create model
