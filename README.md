@@ -1,5 +1,6 @@
 # PyTorch implementation for Bi-directional Attention Flow model 
-https://arxiv.org/abs/1611.01603
+Question answering system based on the paper https://arxiv.org/abs/1611.01603. This is a slightly modified version where its answer selection module use bilinear function, giving slight improvement in accuracy over the original model. Part of the code are from https://github.com/jojonki/BiDAF. 
+
 In Order to run,
 ## 1. Download  SQuAD dataset and GloVe embeddings
 (~850 MB, this will download files to `$HOME/data`):
